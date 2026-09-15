@@ -71,25 +71,7 @@ The species-specific scripts follow the same general processing structure used i
 
 ## Software and R packages
 
-The analyses were implemented in R. The principal packages used across the species-specific workflows include:
-
-- `tidyverse`
-- `lubridate`
-- `sf`
-- `sp`
-- `amt`
-- `momentuHMM`
-- `lookup`
-- `writexl`
-- `raster`
-- `suncalc`
-- `DT`
-- `htmltools`
-- `future`
-- `furrr`
-- `purrr`
-
-Package requirements can differ slightly among species. The corresponding R Markdown files provide the definitive record of the packages and processing steps used for each analysis.
+The analyses were implemented in R. 
 
 ## Input data and reproducibility
 
