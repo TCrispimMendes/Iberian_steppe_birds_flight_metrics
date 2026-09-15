@@ -16,7 +16,7 @@ The workflow was developed for five Iberian steppe bird species:
 
 Each species is represented by an R Markdown (`.Rmd`) file and a rendered HTML (`.html`) version documenting the analytical workflow.
 
-Suggested repository structure:
+Repository structure:
 
 ```text
 .
