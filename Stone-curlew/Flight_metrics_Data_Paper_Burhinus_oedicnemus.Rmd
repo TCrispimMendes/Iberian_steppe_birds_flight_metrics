@@ -1,0 +1,2006 @@
+---
+title: "Flight metrics - Stone-curlew (Burhinus oedicnemus)"
+author: "Tiago Crispim-Mendes"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+
+project_root <- Sys.getenv("FLIGHT_METRICS_PROJECT_ROOT")
+
+if (!nzchar(project_root)) {
+  stop(
+    "Set the FLIGHT_METRICS_PROJECT_ROOT environment variable ",
+    "to the local project directory before rendering this document."
+  )
+}
+
+if (!dir.exists(project_root)) {
+  stop("FLIGHT_METRICS_PROJECT_ROOT does not point to an existing directory.")
+}
+
+knitr::opts_knit$set(root.dir = project_root)
+
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE
+)
+
+```
+
+# Load packages
+
+```{r message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(sp)
+library(amt)
+library(momentuHMM)
+library(lookup)
+library(raster)
+library(DT)
+library(htmltools)
+library(future)
+library(furrr)
+library(purrr)
+
+# Compute great-circle distance between successive locations in kilometres
+haversine_distance <- function(lat1, lon1, lat2, lon2) {
+  r <- 6371  # Earth's radius in km
+  p <- pi / 180
+  a <- 0.5 - cos((lat2 - lat1) * p) / 2 +
+    cos(lat1 * p) * cos(lat2 * p) *
+    (1 - cos((lon2 - lon1) * p)) / 2
+  return(2 * r * asin(sqrt(a)))  # result in km
+}
+
+```
+
+# Paths
+
+Define input and output directories used throughout the workflow. The project root is supplied through the `FLIGHT_METRICS_PROJECT_ROOT` environment variable so that no machine-specific path is stored in the published code.
+
+```{r}
+
+project_data_dir <- "Data"
+project_results_dir <- "Results"
+
+species_dir <- file.path("Stone_Curlew")
+raw_data_dir <- file.path(project_data_dir, species_dir, "Raw")
+derived_data_dir <- file.path(project_data_dir, species_dir, "Data_paper")
+results_dir <- file.path(project_results_dir, species_dir, "Data_paper")
+
+# Create output directories if they do not exist
+dir.create(derived_data_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+# Load individual information
+
+Load metadata used to match device identifiers to individuals and retrieve deployment, sex, age, and device information
+
+```{r}
+
+individual_info <- read.csv(
+  file.path(raw_data_dir, "Individuals_data", "Info_individuals_SC.csv"),
+  sep = ";",
+  na.strings = c("", "NA"),
+  stringsAsFactors = FALSE
+)
+
+```
+
+# Data preparation
+
+Prepare per-individual tracking datasets, identify acquisition modes, derive phenological phase and daytime period, extract terrain elevation, and create the 30-min resampled sequences used in later analyses
+
+```{r, warning=FALSE}
+
+# List all raw tracking files
+files <- list.files(path = raw_data_dir,pattern = "0\\.csv$")
+
+# Define speed thresholds used to identify flight records and valid boost flights
+flight_speed_threshold_km_h<-7
+displacement_speed_threshold_km_h<- 3  
+
+# Load the UTM grid used to match each location to the appropriate DEM tile
+utm_grid <- st_read(
+  "MDT/MTN25_ACTUAL_ETRS89_Peninsula_Baleares_Canarias.shp",
+  quiet = TRUE
+)
+utm_grid <- st_transform(utm_grid, CRS("+init=epsg:25830"))
+
+# Store one summary row per individual
+individual_summary<-NULL
+
+for(i in files) {
+  tryCatch({
+    
+    # Keep GPS records only and preserve chronological order
+    x <- read.csv(file.path(raw_data_dir, i), sep = ",") %>%
+      dplyr::filter(datatype == "GPS")
+
+    x$UTC_datetime <- as.POSIXct(
+      x$UTC_datetime,
+      format = "%Y-%m-%d %H:%M:%OS",
+      tz = "GMT"
+    )
+    
+    x <- x %>%dplyr::arrange(UTC_datetime)
+    
+    # Remove pre-existing coordinate fields that will be recalculated below
+    x <- x %>% dplyr::select(-dplyr::any_of("X"))
+    
+    # Match each file to a single tracked individual
+    individual <-lookup(unique(na.omit(x$device_id)),individual_info$IDnum,individual_info$ID_new)
+    x$Individual_ID <- individual
+    
+    # Shift exact midnight timestamps slightly to avoid ordering problems
+    x <- x %>%
+      mutate(
+        UTC_datetime = if_else(
+          format(UTC_datetime, "%H:%M:%S") == "00:00:00",
+          UTC_datetime + seconds(1),
+          UTC_datetime
+        )
+      )
+    
+    # Harmonise altitude field names across files
+    if ("MSL_altitude_m" %in% names(x)) {
+      x <- x %>%
+        dplyr::rename(Altitude_m = MSL_altitude_m)
+      }
+    
+    # Harmonise speed field names across files
+    if ("speed_km.h" %in% names(x)) {
+      x <- x %>%
+        dplyr::rename(speed_km_h = `speed_km.h`)
+      }
+    
+    # Exclude the first week after deployment and all records after the last transmission
+    deploy<-lookup(individual,individual_info$ID_new,individual_info$capture_date)
+    death<-lookup(individual,individual_info$ID_new,individual_info$last_location)
+    
+    x<-x[x$UTC_date>as.Date(deploy) + 7,]
+    x<-x[x$UTC_date<as.Date(death),]
+    
+    # Create a stable row identifier for joins throughout the workflow
+    x$IDorder <- seq_len(nrow(x))
+    
+    # Append device metadata to each record
+    x$gps_brand<-lookup(individual,individual_info$ID_new,individual_info$GPS_Brand)
+    x$gps_model<-lookup(individual,individual_info$ID_new,individual_info$GPS_Model)
+    x$gps_model_full<-lookup(individual,individual_info$ID_new,individual_info$GPS_Model_full)
+
+
+    # Derive coordinates in geographic and projected reference systems
+    x_sf <- st_as_sf(x, coords = c("Longitude", "Latitude"), crs = 4326)
+    
+    x <- x_sf %>%
+      mutate(
+        X = st_coordinates(.)[, 1],
+        Y = st_coordinates(.)[, 2],
+        X_25829 = st_coordinates(st_transform(geometry, crs = 25829))[, 1],
+        Y_25829 = st_coordinates(st_transform(geometry, crs = 25829))[, 2],
+        X_25830 = st_coordinates(st_transform(geometry, crs = 25830))[, 1],
+        Y_25830 = st_coordinates(st_transform(geometry, crs = 25830))[, 2]
+      ) %>%
+      st_drop_geometry() 
+    
+    # Assign each record to the focal phenological phases used in the analyses
+    classify_phenology <- function(x) {
+      x <- x %>%
+        mutate(
+          phen_phase = case_when(
+            (month(UTC_datetime) %in% 3:8)  ~ "breeding",
+            (month(UTC_datetime) %in% 10:12)| (month(UTC_datetime) == 1) ~ "winter",
+            TRUE ~ "other"
+            )
+          ) #%>%
+      return(x)
+      }
+
+    x <- classify_phenology(x)
+    
+        # Calculate sunrise and sunset for each GPS fix
+    sun_input <- x %>%
+      transmute(
+        IDorder,
+        date = as.Date(UTC_date),
+        lat = Y,
+        lon = X
+      )
+    
+    sun_times <- suncalc::getSunlightTimes(
+      data = sun_input %>%
+        dplyr::select(date, lat, lon),
+      keep = c("sunrise", "sunset"),
+      tz = "UTC"
+    ) %>%
+      mutate(
+        IDorder = sun_input$IDorder
+      ) %>%
+      dplyr::select(
+        IDorder,
+        sunrise,
+        sunset
+      )
+    
+    # Classify each GPS fix by daytime period using custom dawn/dusk windows
+    # Dawn and dusk are defined as 2-hour windows centred on sunrise and sunset, respectively
+    x <- x %>%
+      left_join(sun_times, by = "IDorder") %>%
+      mutate(
+        tod = case_when(
+          UTC_datetime >= sunrise - hours(1) &
+            UTC_datetime <= sunrise + hours(1) ~ "dawn",
+          
+          UTC_datetime >= sunset - hours(1) &
+            UTC_datetime <= sunset + hours(1) ~ "dusk",
+          
+          UTC_datetime > sunrise + hours(1) &
+            UTC_datetime < sunset - hours(1) ~ "day",
+          
+          TRUE ~ "night"
+        ),
+        
+        tod = factor(
+          tod,
+          levels = c("dawn", "day", "dusk", "night")
+        )
+      ) %>%
+      dplyr::select(
+        -sunrise,
+        -sunset
+      )
+    
+    # Compute elapsed time between consecutive records
+    x$lag_original <- c(NA, diff(x$UTC_datetime, units = "secs"))
+    
+    # Identify short-interval sequences corresponding to burst and boost acquisitions
+    x$burst<-ifelse(x$lag_original<11, 1,0)
+    
+    x$burst2<-NA
+    x$acquisition_mode<-NA
+    x<-x[!is.na(x$UTC_datetime),]
+    rownames(x) <- 1:nrow(x)
+    
+    y<-rle(x$burst == 1)
+    y$sumcum<-cumsum(y$lengths)
+    
+    for(j in 2:length(y$sumcum)) { 
+      
+      if(y$values[j]=="TRUE"){
+        
+        ya<-y$sumcum[j-1]
+        yb<-y$sumcum[j]
+        
+        x$burst2[ya:yb]<-y$lengths[j]+1
+        x$acquisition_mode[ya:yb]<-"burst_boost"
+        x$acquisition_mode[yb]<-ifelse(x$burst2[yb]>6,"boost_end","burst_end")
+        
+      }else{
+        
+        if(y$lengths[j]==1){
+        }else{
+          
+          ya<-y$sumcum[j-1]+1
+          yb<-y$sumcum[j]-1
+          
+          x$burst2[ya:yb]<-y$lengths[j]-1
+          x$acquisition_mode[ya:yb]<-"simple"
+          
+        }
+        
+      }}
+    
+    # Reduce acquisition labels to the categories used in downstream analyses
+    x$acquisition_mode2<-ifelse(c(x$acquisition_mode=="burst_boost"&x$burst2>6),"boost","burst")
+    x$acquisition_mode2<-ifelse(c(x$acquisition_mode=="burst_boost"&x$burst==0&x$burst2>6),"boost_start",x$acquisition_mode2)
+    x$acquisition_mode2<-ifelse(c(x$acquisition_mode=="simple"),"simple",x$acquisition_mode2)
+    x$acquisition_mode2<-ifelse(c(x$acquisition_mode=="burst_end"),"burst_end",x$acquisition_mode2)
+    x$acquisition_mode2<-ifelse(c(x$acquisition_mode=="boost_end"),"boost_end",x$acquisition_mode2)
+    
+    x$acquisition_mode<-x$acquisition_mode2
+    x$acquisition_mode2<-NULL
+    
+    # Use speed to separate clearly stationary records from likely flight records
+    x <- x %>%
+    mutate(behavior = case_when(
+      speed_km_h == 0 ~ "stationary",
+      speed_km_h > flight_speed_threshold_km_h  ~ "flight",
+      TRUE ~ NA_character_
+    ))
+    
+    # Flag low-quality points and implausible displacements before further processing
+    x$filter<-ifelse(c(x$acquisition_mode=="burst"|x$X==0|x$Y==0|x$satcount<4),"REMOVE","OK")
+    
+    data <- x %>% 
+      filter(acquisition_mode %in% c("simple", "burst_end", "boost_start")& 
+      filter == "OK")
+    
+    data <- data %>%
+      mutate(
+        distancefromKM = haversine_distance(lag(Y), lag(X), Y, X)
+        )
+    
+    data$difftimefrom <- c(NA, diff(data$UTC_datetime, units = "secs"))
+    data$difftimefromHR<-data$difftimefrom/3600
+    
+    data$KMH<-as.numeric(data$distancefromKM/data$difftimefromHR)
+    data$outlier<-ifelse(data$KMH>150, "yes","no")
+    
+    x$outlier<-lookup(x$IDorder,data$IDorder,data$outlier)
+     
+    x$filter<-ifelse(c(x$outlier=="yes"|x$acquisition_mode=="burst"|x$X==0|x$Y==0|x$satcount<4),"REMOVE","OK")
+    
+    # Extract ground elevation from the appropriate DEM tile and derive altitude above ground
+    altitude_input_data <- x %>%
+      dplyr::filter(is.na(filter) | filter == "OK")
+    
+    altitude_input_data$X_25830_original <- altitude_input_data$X_25830
+    altitude_input_data$Y_25830_original <- altitude_input_data$Y_25830
+    
+    altitude_points_sf <- st_as_sf(
+      x = altitude_input_data,
+      coords = c("X_25830", "Y_25830"),
+      crs = CRS("+init=epsg:25830")
+    )
+    
+    altitude_points_intersection <- st_intersection(utm_grid, altitude_points_sf)
+    
+    altitude_points_intersection <- altitude_points_intersection[
+      , !(names(altitude_points_intersection) %in% c("gid", "huso2", "solape", "edicion"))
+    ]
+    
+    altitude_points_intersection$X_25830 <- altitude_points_intersection$X_25830_original
+    altitude_points_intersection$Y_25830 <- altitude_points_intersection$Y_25830_original
+    
+    # Store terrain extraction results across DEM tiles
+    altitude_results_list <- list()
+    
+    for (j in unique(na.omit(altitude_points_intersection$numero))) {
+      tryCatch({
+        altitude_points_zone <- altitude_points_intersection[altitude_points_intersection$numero == j, ]
+        altitude_points_zone <- data.frame(altitude_points_zone)
+        altitude_points_zone <- altitude_points_zone[!is.na(altitude_points_zone$X_25830), ]
+        altitude_points_zone <- altitude_points_zone[, !(names(altitude_points_zone) %in% c("geometry"))]
+    
+        coordinates(altitude_points_zone) <- cbind(
+          altitude_points_zone$X_25830,
+          altitude_points_zone$Y_25830
+        )
+        crs(altitude_points_zone) <- CRS("+init=epsg:25830")
+    
+        mdt_file <- NULL
+    
+        # Extract terrain elevation using the appropriate UTM zone
+        altitude_points_zone$ground_elevation <- ifelse(
+          altitude_points_zone$huso == 30,
+          {
+            mdt_file <- paste0(
+              "MDT/MDT02-ETRS89-HU",
+              unique(na.omit(altitude_points_zone$huso)),
+              "-",
+              j,
+              "-COB2.tif"
+            )
+            mdt <- raster(mdt_file)
+            crs(mdt) <- CRS("+init=epsg:25830")
+            raster::extract(mdt, altitude_points_zone)
+          },
+          ifelse(
+            altitude_points_zone$huso == 29,
+            {
+              altitude_points_zone <- spTransform(
+                altitude_points_zone,
+                CRS("+init=epsg:25829")
+              )
+    
+              mdt_file <- paste0(
+                "MDT/MDT02-ETRS89-HU",
+                unique(na.omit(altitude_points_zone$huso)),
+                "-",
+                j,
+                "-COB2.tif"
+              )
+              mdt <- raster(mdt_file)
+              crs(mdt) <- CRS("+init=epsg:25829")
+              raster::extract(mdt, altitude_points_zone)
+            },
+            NA
+          )
+        )
+    
+        altitude_points_zone <- as.data.frame(altitude_points_zone)
+        altitude_points_zone <- altitude_points_zone[
+          , !(names(altitude_points_zone) %in% c("coords.x1", "coords.x2"))
+        ]
+    
+        altitude_points_zone$altitude_above_ground <-
+          altitude_points_zone$Altitude_m - altitude_points_zone$ground_elevation
+    
+        altitude_results_list[[length(altitude_results_list) + 1]] <- altitude_points_zone
+    
+      }, error = function(e) {
+        cat(
+          "ERROR:",
+          individual,
+          conditionMessage(e),
+          if (!is.null(mdt_file)) mdt_file else "",
+          "\n"
+        )
+      })
+    }
+    
+    altitude_results <- dplyr::bind_rows(altitude_results_list) %>%
+      dplyr::select(dplyr::any_of(c("IDorder", "huso", "ground_elevation", "altitude_above_ground")))
+    
+    # Merge terrain-based altitude estimates back into the full dataset
+    if (nrow(altitude_results) == 0) {
+      x$huso <- NA
+      x$ground_elevation <- NA
+      x$altitude_above_ground <- NA
+    } else {
+      x <- x %>%
+        left_join(altitude_results, by = "IDorder")
+    }
+    
+    # Assign UTM zone 29 to unmatched records after DEM extraction
+    if (any(is.na(x$huso))) {
+      x$huso[is.na(x$huso)] <- 29
+    }
+    
+    # Assign a boost identifier to each boost sequence
+    x$boostID<-NA
+    id<-1
+    for(k in 2:nrow(x)){
+      tryCatch({
+        if(!is.na(x$acquisition_mode[k]) && x$acquisition_mode[k] == "boost_start") {      
+          x2<-x[k:nrow(x),]
+          x$boostID[k:rownames(x2[x2$acquisition_mode=="boost_end",])[1]]<-paste("boost_",id,sep="")
+          id<-id+1
+          }  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+    }
+    
+    # Identify boost sequences that likely correspond to flight events
+    x$KMH_boost <- NA
+    x$boost_flight_ID <- NA
+    flight_id <- 1
+    
+    for (k in 2:nrow(x)) {
+      tryCatch({
+        if (!is.na(x$acquisition_mode[k]) && x$acquisition_mode[k] == "boost_start") {  
+          
+          x2 <- x[k:nrow(x),]
+          boost_end_idx <- rownames(x2[x2$acquisition_mode == "boost_end", ])[1]
+          
+          if (!is.na(boost_end_idx)) {
+            boost_range <- k:as.integer(boost_end_idx)
+            
+            speed_condition <- any(x$speed_km_h[boost_range] > flight_speed_threshold_km_h, na.rm = TRUE)
+            
+            start_point <- x[k, ]
+            end_point <- x[as.integer(boost_end_idx), ]
+            
+            distance_boost <- haversine_distance(start_point$Y, start_point$X, end_point$Y, end_point$X)
+            
+            time_boost_sec <- as.numeric(difftime(end_point$UTC_datetime, start_point$UTC_datetime, units = "secs"))
+            
+            KMH_boost <- ifelse(time_boost_sec > 0, (distance_boost / time_boost_sec) * 3600, 0)
+            
+            x$KMH_boost[boost_range] <- KMH_boost
+            
+            if (speed_condition && KMH_boost > displacement_speed_threshold_km_h) {
+              x$boost_flight_ID[boost_range] <- paste("boostflight_", flight_id, sep = "")
+              flight_id <- flight_id + 1
+            }
+          }
+        }
+      }, error = function(e) { cat("ERROR :", conditionMessage(e), "\n") })
+    }
+
+    # Resample valid records to a standard 30-min interval within each phenological phase
+    x_split <- x %>%
+      filter(!is.na(filter) & filter == "OK") %>%
+      group_split(phen_phase)
+    
+    x_processed <- lapply(x_split, function(df) {
+      
+      x_track_data <- make_track(
+        df, .x = X, .y = Y, .t = UTC_datetime,
+        crs = 4326, IDorder = IDorder
+      )
+      
+      x_resampled_track <- x_track_data |>
+        track_resample(rate = minutes(30), tolerance = minutes(2)) |>
+        filter_min_n_burst(min_n = 3)
+      
+      df <- df %>%
+        left_join(
+          dplyr::select(x_resampled_track, IDorder, ID_keep = burst_),
+          by = "IDorder"
+        )
+      
+      # Store each retained 30-min sequence as an individual- and phase-specific identifier
+      df$ID_keep <- ifelse(
+        !is.na(df$ID_keep),
+        paste0(df$Individual_ID, "_",df$phen_phase, "_", df$ID_keep),
+        df$ID_keep
+      )
+      df$ID_keep <- as.character(df$ID_keep)
+      
+      return(df)
+    })
+    
+    all_processed <- bind_rows(x_processed)
+    
+    x <- x %>%
+      left_join(
+        dplyr::select(all_processed, IDorder, ID_keep),
+        by = "IDorder"
+      )
+
+    # Summarise tracking coverage and the amount of data retained at each step
+    individual_summary_temp <- tibble(
+      individual_id = unique(x$Individual_ID),
+      sex = lookup(unique(na.omit(x$device_id)), individual_info$IDnum, individual_info$Sex),
+      age = lookup(unique(na.omit(x$device_id)), individual_info$IDnum, individual_info$Age),
+      gps_brand = unique(x$gps_brand),
+      gps_model = unique(x$gps_model),
+      gps_model_full = unique(x$gps_model_full),
+      tracking_start = min(x$UTC_date, na.rm = TRUE),
+      tracking_end = max(x$UTC_date, na.rm = TRUE),
+      tracking_duration_days = round(as.numeric(difftime(max(x$UTC_datetime, na.rm = TRUE), min(x$UTC_datetime, na.rm = TRUE), units = "days"))),
+      n_fixes_raw = nrow(x),
+      n_fixes_30min = sum(!is.na(x$ID_keep)),
+      n_fixes_stationary = sum(x$behavior == "stationary", na.rm = TRUE),
+      n_fixes_flight = sum(x$behavior == "flight", na.rm = TRUE)
+    )
+    
+    phases <- c("winter", "breeding", "other")
+    
+    # Add phase-specific counts for the main acquisition and behavioural categories
+    for (phase in phases) {
+      x_phase <- x[x$phen_phase == phase & !is.na(x$phen_phase), ]
+      individual_summary_temp[[paste0("n_fixes_simple_", phase)]] <- sum(x_phase$acquisition_mode == "simple", na.rm = TRUE)
+      individual_summary_temp[[paste0("n_burst_events_", phase)]] <- sum(x_phase$acquisition_mode == "burst_end", na.rm = TRUE)
+      individual_summary_temp[[paste0("n_boost_events_", phase)]] <- sum(x_phase$acquisition_mode == "boost_end", na.rm = TRUE)
+      individual_summary_temp[[paste0("n_boost_flight_events_", phase)]] <- length(unique(na.omit(x_phase$boost_flight_ID)))
+      individual_summary_temp[[paste0("n_fixes_30min_", phase)]] <- sum(!is.na(x_phase$ID_keep))
+      individual_summary_temp[[paste0("n_sequences_30min_", phase)]] <- length(unique(na.omit(x_phase$ID_keep)))
+      individual_summary_temp[[paste0("n_fixes_stationary_", phase)]] <- sum(x_phase$behavior == "stationary" &!is.na(x_phase$altitude_above_ground), na.rm = TRUE)
+      individual_summary_temp[[paste0("n_fixes_flight_", phase)]] <- sum(x_phase$behavior == "flight"&!is.na(x_phase$altitude_above_ground), na.rm = TRUE)
+    }
+
+    individual_summary<-rbind(individual_summary,individual_summary_temp)
+    
+    # Save the prepared per-individual dataset used in downstream analyses
+    write.csv(x,file.path(derived_data_dir, paste0(individual, "_Data_Prep.csv")),row.names = FALSE)
+
+}, error=function(e){cat("ERROR:",individual,conditionMessage(e), "\n")})
+
+}
+
+# Save the individual-level summary table
+individual_summary <- individual_summary %>% arrange(individual_id)
+write.csv(individual_summary, file.path(results_dir, "Individuals_data_summary.csv"), row.names = FALSE)
+
+tagList(
+  h3("Individual summary"),
+  datatable(individual_summary, options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 10))
+)
+
+```
+
+# Boosts
+
+## Correction factor for flight distances
+
+Summarise high-frequency boost flights to estimate the ratio between cumulative path length and straight-line displacement
+
+```{r}
+
+# List prepared per-individual datasets
+files <- list.files(path = derived_data_dir, pattern = "Data_Prep\\.csv$")
+
+# Store boost records and per-flight summaries across all individuals
+boost_flight_data_list <- list()
+boost_distance_summary_list <- list()
+
+for (i in files) {
+  tryCatch({
+    # Read one prepared dataset and preserve chronological order
+    df_complete <- read.csv(file.path(derived_data_dir, i), sep = ",") %>%
+      dplyr::mutate(
+        device_id = as.character(device_id),
+        Individual_ID = as.character(Individual_ID),
+        boost_flight_ID = as.character(boost_flight_ID),
+        boostID = as.character(boostID),
+        phen_phase = as.character(phen_phase),
+        acquisition_mode = as.character(acquisition_mode),
+        behavior = as.character(behavior),
+        filter = as.character(filter)
+      )
+    
+    # Match the file to a single individual
+    individual <- lookup(
+      unique(na.omit(df_complete$device_id)),
+      individual_info$IDnum,
+      individual_info$ID_new
+    )
+    
+    df_complete$UTC_datetime <- as.POSIXct(
+      df_complete$UTC_datetime,
+      format = "%Y-%m-%d %H:%M:%OS",
+      tz = "GMT"
+    )
+    
+    df_complete <- df_complete[order(df_complete$UTC_datetime), ]
+    
+    # Keep only boost sequences previously classified as flight
+    df_filtered <- df_complete[!is.na(df_complete$boost_flight_ID), ]
+    
+    if (nrow(df_filtered) > 0) {
+      boost_flight_data_list[[length(boost_flight_data_list) + 1]] <- df_filtered
+    }
+    
+    # Summarise each boost flight independently
+    for (boost_id in unique(df_filtered$boost_flight_ID)) {
+      
+      df_boost <- df_filtered[df_filtered$boost_flight_ID == boost_id, ]
+      df_boost <- df_boost[order(df_boost$UTC_datetime), ]
+      
+      # Skip incomplete boost flights with fewer than two records
+      if (nrow(df_boost) < 2) next
+      
+      phen_phase <- unique(df_boost$phen_phase)[1]
+      
+      # Sum successive step lengths within the boost sequence
+      df_boost$distancefromKM <- haversine_distance(
+        lag(df_boost$Y),
+        lag(df_boost$X),
+        df_boost$Y,
+        df_boost$X
+      )
+      
+      total_distance <- sum(df_boost$distancefromKM, na.rm = TRUE)
+      
+      # Compare cumulative distance with straight-line displacement
+      first_point <- df_boost[1, ]
+      last_point <- df_boost[nrow(df_boost), ]
+      
+      displacement <- haversine_distance(
+        first_point$Y,
+        first_point$X,
+        last_point$Y,
+        last_point$X
+      )
+      
+      correction_factor <- ifelse(displacement > 0, total_distance / displacement, NA_real_)
+      
+      result <- data.frame(
+        Individual_ID = individual,
+        boost_flight_ID = boost_id,
+        first_datetime = first_point$UTC_datetime,
+        last_datetime = last_point$UTC_datetime,
+        phen_phase = phen_phase,
+        total_distance_Km = total_distance,
+        displacement_Km = displacement,
+        correction_factor = correction_factor
+      )
+      
+      boost_distance_summary_list[[length(boost_distance_summary_list) + 1]] <- result
+    }
+    
+  }, error = function(e) {
+    cat("ERROR in file:", i, "-", conditionMessage(e), "\n")
+  })
+}
+
+# Combine all boost-level outputs
+boost_flight_data <- dplyr::bind_rows(boost_flight_data_list)
+boost_distance_summary <- dplyr::bind_rows(boost_distance_summary_list)
+
+# Summarise correction factors by phenological phase
+summary_table_correction_factor <- boost_distance_summary %>%
+  group_by(phen_phase) %>%
+  summarise(
+    mean_correction_factor = mean(correction_factor, na.rm = TRUE),
+    sd_correction_factor = sd(correction_factor, na.rm = TRUE),
+    median_correction_factor = median(correction_factor, na.rm = TRUE)
+  )
+
+# Add a global summary across all phases
+total_summary_correction_factor <- boost_distance_summary %>%
+  summarise(
+    phen_phase = "Global",
+    mean_correction_factor = mean(correction_factor, na.rm = TRUE),
+    sd_correction_factor = sd(correction_factor, na.rm = TRUE),
+    median_correction_factor = median(correction_factor, na.rm = TRUE)
+  )
+
+summary_correction_factor <- bind_rows(summary_table_correction_factor, total_summary_correction_factor)
+
+tagList(
+  h3("Correction factor"),
+  datatable(summary_correction_factor, options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 5))
+)
+
+```
+
+## Boost displacement 30 min
+
+Match each boost start to the nearest valid location approximately 30 min later to derive the flight displacement used to inform HMM initial values
+
+```{r, warning=FALSE}
+
+# List prepared per-individual datasets
+files <- list.files(path = derived_data_dir,pattern = "Data_Prep\\.csv$")
+
+# Store one summary row per matched boost pair
+boost_displacement_summary <- NULL
+
+for (file_name in files) {
+  tryCatch({
+    # Read one prepared dataset and preserve chronological order
+    df_complete <- read.csv(
+      file.path(derived_data_dir, file_name),
+      sep = ","
+    )
+    
+    individual <- lookup(
+      unique(na.omit(df_complete$device_id)),
+      individual_info$IDnum,
+      individual_info$ID_new
+    )
+    
+    df_complete$UTC_datetime <- as.POSIXct(
+      df_complete$UTC_datetime,
+      format = "%Y-%m-%d %H:%M:%OS",
+      tz = "GMT"
+    )
+    
+    df_complete <- df_complete[order(df_complete$UTC_datetime), ]
+    
+    # Use only valid records when matching the 30-min endpoint
+    df_filtered <- df_complete[!is.na(df_complete$filter) & df_complete$filter == "OK", ]
+    
+    # Keep boost starts associated with boost flights
+    df_boost <- df_filtered %>%
+      dplyr::filter(acquisition_mode == "boost_start", !is.na(boost_flight_ID))
+    
+    if (nrow(df_boost) > 0) {
+      
+      # Store matched start-end pairs
+      df_boost_pairs <- data.frame()
+      counter <- 1
+      
+      for (j in 1:nrow(df_boost)) {
+        start_point <- df_boost[j, ]
+        target_time <- start_point$UTC_datetime + 1800
+        
+        # Search for the nearest valid point after the boost start
+        candidates <- df_filtered %>%
+          dplyr::filter(UTC_datetime > start_point$UTC_datetime)
+        
+        if (nrow(candidates) > 0) {
+          candidates$delta_abs <- abs(as.numeric(
+            difftime(candidates$UTC_datetime, target_time, units = "secs")
+          ))
+          
+          closest_candidate <- candidates[which.min(candidates$delta_abs), ]
+          
+          delta_real <- as.numeric(
+            difftime(closest_candidate$UTC_datetime, start_point$UTC_datetime, units = "secs")
+          )
+          
+          # Retain matches within a ±3 min tolerance around 30 min
+          if (delta_real >= 1620 && delta_real <= 1980) {
+            temp_rows <- dplyr::bind_rows(start_point, closest_candidate)
+            temp_rows$ID_boost_to <- paste0(start_point$device_id, "_", counter)
+            df_boost_pairs <- dplyr::bind_rows(df_boost_pairs, temp_rows)
+            counter <- counter + 1
+          }
+        }
+      }
+      
+      # Summarise each matched pair as a single 30-min displacement value
+      if (nrow(df_boost_pairs) > 0) {
+        
+        df_boost_pairs <- df_boost_pairs %>%
+          dplyr::arrange(ID_boost_to, UTC_datetime) %>%
+          dplyr::group_by(ID_boost_to) %>%
+          dplyr::mutate(
+            displacement_30min = haversine_distance(dplyr::lag(Y), dplyr::lag(X), Y, X)
+          ) %>%
+          dplyr::summarise(
+            Individual_ID = dplyr::first(Individual_ID),
+            boost_flight_ID = dplyr::first(stats::na.omit(boost_flight_ID)),
+            phen_phase = dplyr::first(phen_phase),
+            displacement_30min = dplyr::first(stats::na.omit(displacement_30min)),
+            .groups = "drop"
+          )
+        
+        boost_displacement_summary <- dplyr::bind_rows(
+          boost_displacement_summary,
+          df_boost_pairs
+        )
+      }} 
+  }, error = function(e) {cat("ERROR:", file_name, "-", conditionMessage(e), "\n")})
+  }
+
+# Summarise 30-min displacement globally and by phenological phase
+flight_displacement_calibration_global <- boost_displacement_summary %>%
+  summarise(
+    phen_phase = "Global",
+    mean_displacement = mean(displacement_30min, na.rm = TRUE),
+    sd_displacement = sd(displacement_30min, na.rm = TRUE),
+    )
+
+flight_displacement_calibration_by_phase <- boost_displacement_summary %>%
+  group_by(phen_phase) %>%
+  summarise(
+    mean_displacement = mean(displacement_30min, na.rm = TRUE),
+    sd_displacement = sd(displacement_30min, na.rm = TRUE),
+    )
+
+flight_displacement_summary <- bind_rows(flight_displacement_calibration_global, flight_displacement_calibration_by_phase)
+
+tagList(
+  h3("Flight displacement summary"),
+  datatable(flight_displacement_summary, options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 5))
+)
+
+```
+
+## Boost flight data
+
+Derive step lengths and turning angles for boost flights and export the boost-level movement dataset used for calibration
+
+```{r, warning=FALSE}
+
+boost_flight_data <- boost_flight_data %>%
+  mutate(
+    ID = paste0(Individual_ID, "_", boost_flight_ID),
+    x = as.numeric(X),
+    y = as.numeric(Y),
+    time = as.POSIXct(UTC_datetime, tz = "UTC")
+  ) %>%
+  filter(!is.na(ID), !is.na(x), !is.na(y), !is.na(time)) %>%
+  arrange(ID, time)
+
+boost_flight_data_step_angle <- prepData(boost_flight_data, type = "LL")
+
+# Export the boost-level dataset with step lengths and turning angles
+boost_flight_data_filtered <- boost_flight_data_step_angle %>%
+  dplyr::select(
+    Individual_ID,
+    boost_flight_ID,
+    step,
+    angle,
+    UTC_datetime,
+    phen_phase,
+    tod,
+    acquisition_mode,
+    satcount,
+    U_bat_mV,
+    bat_soc_pct,
+    solar_I_mA,
+    hdop,
+    Altitude_m,
+    speed_km_h,
+    direction_deg,
+    temperature_C,
+    mag_x, mag_y, mag_z,
+    acc_x, acc_y, acc_z,
+    behavior,
+    ground_elevation,
+    altitude_above_ground
+  )
+
+write.csv(boost_flight_data_filtered,file.path(results_dir,"Boost_flight_data.csv"),row.names = FALSE)
+
+```
+
+## Boost summary
+
+Combine within-boost path metrics with the matched 30-min displacement summary
+
+```{r, warning=FALSE}
+
+boost_flight_summary <- boost_distance_summary %>%
+  left_join(
+    boost_displacement_summary,
+    by = c("Individual_ID", "boost_flight_ID", "phen_phase")
+  )%>%
+  dplyr::select(-ID_boost_to)
+
+
+write.csv(boost_flight_summary,file.path(results_dir,"Boost_flight_summary.csv"),row.names = FALSE)
+
+tagList(
+  h3("Boost flight summary"),
+  datatable(boost_flight_summary, options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 5))
+)
+
+```
+
+# Flight Distance
+
+## HMM
+
+### Data preparation
+
+Build the HMM input datasets from 30-min sequences and derive step lengths and turning angles separately for breeding and winter
+
+```{r, warning=FALSE}
+
+# List prepared per-individual datasets
+files <- list.files(path = derived_data_dir,pattern = "Data_Prep\\.csv$")
+
+# Store all retained 30-min records across individuals
+data_list <- list()
+
+for (i in files) {
+  df_complete <- read.csv(
+    file.path(derived_data_dir, i),
+    sep = ","
+  )
+  
+  # Retain only records belonging to 30-min sequences
+  df_filtered <- df_complete %>%
+    dplyr::filter(!is.na(ID_keep)) %>%
+    dplyr::mutate(
+      device_id = as.character(device_id),
+      ID_keep = as.character(ID_keep),
+      boost_flight_ID = as.character(boost_flight_ID),
+      boostID = as.character(boostID))
+  
+  data_list[[length(data_list) + 1]] <- df_filtered
+}
+
+hmm_filtered_data <- dplyr::bind_rows(data_list)
+
+hmm_filtered_data$UTC_datetime <- as.POSIXct(
+  hmm_filtered_data$UTC_datetime,
+  format = "%Y-%m-%d %H:%M:%OS",
+  tz = "GMT"
+)
+
+# Prepare the coordinate and time fields required by momentuHMM
+hmm_filtered_data <- hmm_filtered_data %>%
+  dplyr::mutate(
+    ID = ID_keep,
+    x = as.numeric(X),
+    y = as.numeric(Y),
+    time = UTC_datetime
+  ) %>%
+  dplyr::filter(!is.na(ID), !is.na(x), !is.na(y), !is.na(time))
+
+# Fit separate HMM inputs for the two focal phenological phases
+hmm_filtered_data_breeding <- hmm_filtered_data %>%
+  dplyr::filter(phen_phase == "breeding") %>%
+  dplyr::arrange(ID, time)
+
+hmm_filtered_data_winter <- hmm_filtered_data %>%
+  dplyr::filter(phen_phase == "winter") %>%
+  dplyr::arrange(ID, time)
+
+hmm_filtered_data_other <- hmm_filtered_data %>%
+  dplyr::filter(phen_phase == "other") %>%
+  dplyr::arrange(ID, time)
+
+# Derive step length and turning angle for each sequence
+hmm_data_breeding <- prepData(hmm_filtered_data_breeding, type = "LL")
+hmm_data_breeding$angle[hmm_data_breeding$step == 0] <- 0
+hmm_data_breeding$step[hmm_data_breeding$step == 0] <- 0.0001
+
+hmm_data_winter <- prepData(hmm_filtered_data_winter, type = "LL")
+hmm_data_winter$angle[hmm_data_winter$step == 0] <- 0
+hmm_data_winter$step[hmm_data_winter$step == 0] <- 0.0001
+
+hmm_data_other <- prepData(hmm_filtered_data_other, type = "LL")
+hmm_data_other$angle[hmm_data_other$step == 0] <- 0
+hmm_data_other$step[hmm_data_other$step == 0] <- 0.0001
+write.csv(hmm_data_other, file.path(derived_data_dir, "hmm_data_other.csv"), row.names = FALSE)
+
+```
+
+### breeding
+
+#### Model fitting
+
+Use boost-derived displacement to define biologically plausible starting values for the 3-state HMM fitted to breeding data
+
+```{r fit-hmm-breeding}
+
+# Specify the state-dependent distributions for step length and turning angle
+dist <- list(step = "gamma", angle = "vm")
+
+# Use phase-specific displacement when available, otherwise fall back to the global value
+mean_displacement_breeding <- ifelse("breeding" %in% flight_displacement_summary$phen_phase,
+                                      flight_displacement_summary$mean_displacement[flight_displacement_summary$phen_phase == "breeding"],
+                                      flight_displacement_summary$mean_displacement[flight_displacement_summary$phen_phase == "Global"])
+
+sd_displacement_breeding <- ifelse("breeding" %in% flight_displacement_summary$phen_phase,
+                                      flight_displacement_summary$sd_displacement[flight_displacement_summary$phen_phase == "breeding"],
+                                      flight_displacement_summary$sd_displacement[flight_displacement_summary$phen_phase == "Global"])
+
+
+# Provide initial values for the 3-state HMM
+par0_3_states <- list(step = c(0.01, 0.02, mean_displacement_breeding, 0.01, 0.010 , sd_displacement_breeding), angle = c(0.01, 0.01, 0.01))
+
+hmm_breeding <- fitHMM(hmm_data_breeding, 
+               nbStates = 3, 
+               dist = dist, 
+               retryFits = 0, # 30
+               Par0 = par0_3_states)
+
+print(hmm_breeding)
+
+```
+
+#### Model outputs
+
+Decode the most likely state sequence and export state probabilities to support the interpretation of the fitted breeding HMM
+
+```{r}
+
+hmm_data_breeding$viterbi_state <- factor(viterbi(hmm_breeding))
+  
+sp_breeding <- stateProbs(hmm_breeding)
+colnames(sp_breeding) <- paste0("state_prob_", seq_len(ncol(sp_breeding)))
+
+hmm_data_breeding <- cbind(hmm_data_breeding, sp_breeding)
+
+write.csv(hmm_data_breeding, file.path(derived_data_dir, "hmm_data_breeding.csv"), row.names = FALSE)
+
+# Inspect step-length distributions across the inferred states
+ggplot(hmm_data_breeding, aes(x = step, color = viterbi_state, fill = viterbi_state)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Step Length Density by State - breeding",
+    x = "Step length (km)",
+    y = "Density"
+  ) +
+  theme_classic() +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.1)
+  )
+
+ggplot(hmm_data_breeding, aes(x = viterbi_state, y = step, fill = viterbi_state)) +
+  geom_boxplot() +
+   labs(
+    title = "Step Length Distribution by State - breeding",
+    x = "Movement state",
+    y = "Step length (km)"
+  ) +
+  theme_classic() +
+  scale_y_continuous(breaks = seq(0, 3, by = 0.5))+
+  coord_cartesian(ylim = c(0, 3))
+
+```
+
+#### Plot estimated state-dependent distributions
+
+Inspect the fitted state-dependent distributions and the proportion of time in each state
+
+```{r, fig.keep = 1:10}
+
+plot(hmm_breeding, breaks = 25, ask = FALSE, plotTracks = FALSE)
+
+timeInStates(hmm_breeding)
+
+```
+
+### winter
+
+#### Model fitting
+
+Use boost-derived displacement to define biologically plausible starting values for the 3-state HMM fitted to winter data
+
+```{r fit-hmm-winter}
+
+dist <- list(step = "gamma", angle = "vm")
+
+mean_displacement_winter <- ifelse("winter" %in% flight_displacement_summary$phen_phase,
+                                      flight_displacement_summary$mean_displacement[flight_displacement_summary$phen_phase == "winter"],
+                                      flight_displacement_summary$mean_displacement[flight_displacement_summary$phen_phase == "Global"])
+
+sd_displacement_winter <- ifelse("winter" %in% flight_displacement_summary$phen_phase,
+                                      flight_displacement_summary$sd_displacement[flight_displacement_summary$phen_phase == "winter"],
+                                      flight_displacement_summary$sd_displacement[flight_displacement_summary$phen_phase == "Global"])
+
+
+# Provide initial values for the 3-state winter HMM
+par0_3_states <- list(step = c(0.01, 0.030, mean_displacement_winter, 0.01, 0.010 , sd_displacement_winter), angle = c(0.01, 0.01, 0.01))
+
+hmm_winter <- fitHMM(hmm_data_winter, 
+               nbStates = 3, 
+               dist = dist, 
+               retryFits = 0, # 30
+               Par0 = par0_3_states)
+
+print(hmm_winter)
+
+```
+
+#### Model outputs
+
+Decode winter states and export the corresponding state probabilities
+
+```{r}
+
+hmm_data_winter$viterbi_state <- factor(viterbi(hmm_winter))
+
+sp_winter <- stateProbs(hmm_winter)
+colnames(sp_winter) <- paste0("state_prob_", seq_len(ncol(sp_winter)))
+
+hmm_data_winter <- cbind(hmm_data_winter, sp_winter)
+
+write.csv(hmm_data_winter, file.path(derived_data_dir, "hmm_data_winter.csv"), row.names = FALSE)
+
+# Inspect step-length distributions across the inferred winter states
+ggplot(hmm_data_winter, aes(x = step, color = viterbi_state, fill = viterbi_state)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Step Length Density by State - winter",
+    x = "Step length (km)",
+    y = "Density"
+  ) +
+  theme_classic() +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.1)
+  )
+
+ggplot(hmm_data_winter, aes(x = viterbi_state, y = step, fill = viterbi_state)) +
+  geom_boxplot() +
+   labs(
+    title = "Step Length Distribution by State - winter",
+    x = "Movement state",
+    y = "Step length (km)"
+  ) +
+  theme_classic() +
+  scale_y_continuous(breaks = seq(0, 3, by = 0.5))+
+  coord_cartesian(ylim = c(0, 3))
+
+```
+
+#### Plot estimated state-dependent distributions
+
+Inspect the fitted state-dependent distributions and the proportion of time in each state
+
+```{r, fig.keep = 1:10}
+
+plot(hmm_winter, breaks = 25, ask = FALSE, plotTracks = FALSE)
+
+timeInStates(hmm_winter)
+
+```
+
+### Merge phases
+
+Combine the breeding and winter HMM outputs and harmonise the state labels used in the downstream movement summaries
+
+```{r}
+
+hmm_data_breeding<- read.csv(file.path(derived_data_dir, "hmm_data_breeding.csv"), sep = ",")
+hmm_data_winter<- read.csv(file.path(derived_data_dir, "hmm_data_winter.csv"), sep = ",")
+hmm_data_other <- read.csv(file.path(derived_data_dir, "hmm_data_other.csv"), sep = ",")
+
+data_hmm_all <- bind_rows(hmm_data_breeding, hmm_data_winter, hmm_data_other)
+
+data_hmm_all <- data_hmm_all %>%
+  mutate(
+    state_label = factor(
+      viterbi_state,
+      levels = c("1", "2", "3"),
+      labels = c("rest", "walk", "fly")
+    ),
+    phen_phase = factor(phen_phase, levels = c("breeding", "winter", "other"))
+  )
+
+# Compare state-dependent step lengths between phases
+plot_step_length_distributions <- data_hmm_all %>%
+  filter(phen_phase != "other") %>%
+  ggplot(aes(x = state_label, y = step, fill = state_label)) +
+  geom_boxplot() +
+  facet_wrap(~ phen_phase) +
+  labs(
+    x = "Movement state",
+    y = "Step length (km)"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_y_continuous(breaks = seq(0, 3, by = 0.5)) +
+  coord_cartesian(ylim = c(0, 3))
+
+print(plot_step_length_distributions)
+
+```
+
+## Calculate daily flight distance  
+
+### Add correction factor to distances
+
+Apply the boost-derived correction factor to HMM step lengths to approximate path length more accurately at the 30-min scale
+
+```{r}
+
+data_hmm_all_corrected <- data_hmm_all %>%
+  mutate(
+    correction_factor = ifelse(
+      viterbi_state == 3,
+      ifelse(
+        phen_phase %in% summary_correction_factor$phen_phase,
+        summary_correction_factor$median_correction_factor[
+          match(phen_phase, summary_correction_factor$phen_phase)
+        ],
+        summary_correction_factor$median_correction_factor[
+          summary_correction_factor$phen_phase == "Global"
+        ]
+      ),
+      NA_real_
+    ),
+    corrected_distance = ifelse(
+      viterbi_state == 3,
+      step * correction_factor,
+      NA_real_
+    )
+  )
+
+write.csv(data_hmm_all_corrected,file.path(derived_data_dir, "data_hmm_all_corrected.csv"), row.names = FALSE)
+
+# Export the movement dataset used in distance and height summaries
+movement_data <- data_hmm_all_corrected %>%
+  dplyr::select(
+    Individual_ID,
+    sequence_id = ID,
+    step,
+    angle,
+    UTC_datetime,
+    phen_phase,
+    tod,
+    acquisition_mode,
+    
+    ground_elevation,
+    altitude_above_ground,
+    viterbi_state,	
+    state_label,
+    state_prob_1,	
+    state_prob_2,	
+    state_prob_3,
+    correction_factor,
+    corrected_distance,
+    
+    satcount,
+    U_bat_mV,
+    bat_soc_pct,
+    solar_I_mA,
+    hdop,
+    Altitude_m,
+    speed_km_h,
+    direction_deg,
+    temperature_C,
+    int_temperature_C,
+    mag_x, mag_y, mag_z,
+    acc_x, acc_y, acc_z
+  )%>%
+  mutate(
+    acquisition_mode = dplyr::recode(
+      acquisition_mode,
+      "boost_start" = "boost",
+      "boost_end"   = "boost",
+      "burst_end"   = "burst"
+    )
+  )%>%
+  arrange(Individual_ID, UTC_datetime)
+ 
+write.csv(movement_data,file.path(results_dir, "Movement_data.csv"), row.names = FALSE)
+
+```
+
+### Descriptive summaries of corrected flight distance by phenological phase and daytime period
+
+```{r}
+
+# Load corrected movement data
+data_flight_distance_all <- read.csv(
+  file.path(results_dir, "Movement_data.csv"),
+  sep = ","
+)
+
+# Build continuous 30-min sequences within each original sequence and time-of-day class
+sequence_distance_summary <- data_flight_distance_all %>%
+  filter(phen_phase != "other") %>%
+  mutate(
+    UTC_datetime = as.POSIXct(UTC_datetime, tz = "UTC")
+  ) %>%
+  group_by(sequence_id, tod) %>%
+  mutate(
+    time_diff = as.numeric(difftime(UTC_datetime, lag(UTC_datetime), units = "mins")),
+    new_sequence = ifelse(is.na(time_diff) | time_diff > 35, 1, 0),
+    new_sequence_id = cumsum(new_sequence),
+    global_sequence_id = paste(sequence_id, tod, new_sequence_id, sep = "_")
+  ) %>%
+  ungroup() %>%
+  group_by(global_sequence_id, phen_phase, tod, Individual_ID) %>%
+  summarise(
+    hourly_distance_km = sum(corrected_distance[viterbi_state == 3], na.rm = TRUE) / (n() * 0.5),
+    n_fixes = dplyr::n(),
+    .groups = "drop"
+  )
+
+# Descriptive hourly summaries by phenological phase and daytime period
+flight_distance_hourly_summary <- sequence_distance_summary %>%
+  group_by(phen_phase, tod) %>%
+  summarise(
+    n_individuals = n_distinct(Individual_ID),
+    n_sequences = dplyr::n(),
+    mean_hourly_distance_km = mean(hourly_distance_km, na.rm = TRUE),
+    sd_hourly_distance_km = sd(hourly_distance_km, na.rm = TRUE),
+    median_hourly_distance_km = median(hourly_distance_km, na.rm = TRUE),
+    q25_hourly_distance_km = quantile(hourly_distance_km, 0.25, na.rm = TRUE),
+    q75_hourly_distance_km = quantile(hourly_distance_km, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    species = "Burhinus oedicnemus",
+    phen_phase = factor(phen_phase, levels = c("breeding", "winter")),
+    tod = factor(tod, levels = c("dawn", "day", "dusk", "night"))
+  ) %>%
+  arrange(phen_phase, tod) %>%
+  relocate(species, .before = 1)
+
+tagList(
+  h3("Descriptive hourly flight distance by phenological phase and daytime period"),
+  datatable(
+    flight_distance_hourly_summary,
+    options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 8)
+  )
+)
+
+
+# Define representative calendar windows for the focal phenological phases
+manual_dates <- tibble::tibble(
+  phen_phase = c("breeding", "winter"),
+  start_date = as.Date(c("2025-03-01", "2025-10-01")),
+  end_date   = as.Date(c("2025-08-31", "2026-01-31"))
+)
+
+# Load a dataset that still contains geographic coordinates
+movement_data_with_coords <- read.csv(
+  file.path(derived_data_dir, "data_hmm_all_corrected.csv"),
+  sep = ","
+)
+
+# Prepare one representative location and three representative dates per phase
+phases_days <- manual_dates %>%
+  left_join(
+    movement_data_with_coords %>%
+      filter(phen_phase != "other") %>%
+      group_by(phen_phase) %>%
+      summarise(
+        lon = mean(X, na.rm = TRUE),
+        lat = mean(Y, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "phen_phase"
+  ) %>%
+  mutate(
+    mid_date = start_date + floor((end_date - start_date) / 2),
+    sim_date = pmap(
+      list(start_date, mid_date, end_date),
+      ~ c(..1, ..2, ..3)
+    )
+  ) %>%
+  dplyr::select(phen_phase, sim_date, lon, lat) %>%
+  tidyr::unnest(sim_date) %>%
+  mutate(day_id = row_number())
+
+# Calculate sunrise and sunset for each simulated day
+sun_times <- suncalc::getSunlightTimes(
+  data = phases_days %>%
+    transmute(
+      date = sim_date,
+      lat = lat,
+      lon = lon
+    ),
+  keep = c("sunrise", "sunset"),
+  tz = "UTC"
+) %>%
+  mutate(day_id = phases_days$day_id) %>%
+  dplyr::select(day_id, sunrise, sunset)
+
+# Simulate 30-min points and classify daytime period directly
+tod_duration_summary <- phases_days %>%
+  left_join(sun_times, by = "day_id") %>%
+  tidyr::expand_grid(step = 0:47) %>%
+  mutate(
+    UTC_datetime = as.POSIXct(sim_date, tz = "UTC") + minutes(30 * step),
+    tod = case_when(
+      UTC_datetime >= sunrise - hours(1) &
+        UTC_datetime <= sunrise + hours(1) ~ "dawn",
+      UTC_datetime >= sunset - hours(1) &
+        UTC_datetime <= sunset + hours(1) ~ "dusk",
+      UTC_datetime > sunrise + hours(1) &
+        UTC_datetime < sunset - hours(1) ~ "day",
+      TRUE ~ "night"
+    ),
+    tod = factor(tod, levels = c("dawn", "day", "dusk", "night"))
+  ) %>%
+  group_by(phen_phase, tod) %>%
+  summarise(
+    duration_hours = n() * 0.5 / 3,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phen_phase = factor(phen_phase, levels = c("breeding", "winter")),
+    tod = factor(tod, levels = c("dawn", "day", "dusk", "night"))
+  ) %>%
+  arrange(phen_phase, tod)
+
+tagList(
+  h3("Average TOD duration by phenological phase"),
+  datatable(
+    tod_duration_summary,
+    options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 8)
+  )
+)
+
+
+# Convert hourly descriptive summaries into descriptive daily contributions
+flight_distance_daily_tod_summary <- flight_distance_hourly_summary %>%
+  left_join(tod_duration_summary, by = c("phen_phase", "tod")) %>%
+  mutate(
+    mean_daily_distance_km = mean_hourly_distance_km * duration_hours,
+    sd_daily_distance_km = sd_hourly_distance_km * duration_hours,
+    median_daily_distance_km = median_hourly_distance_km * duration_hours,
+    q25_daily_distance_km = q25_hourly_distance_km * duration_hours,
+    q75_daily_distance_km = q75_hourly_distance_km * duration_hours
+  ) %>%
+  arrange(phen_phase, tod)
+
+# Compute one descriptive total daily distance per phenological phase
+flight_distance_daily_total <- flight_distance_daily_tod_summary %>%
+  group_by(species, phen_phase) %>%
+  summarise(
+    tod = "total_24h",
+    n_individuals = max(n_individuals, na.rm = TRUE),
+    n_sequences = sum(n_sequences, na.rm = TRUE),
+    mean_hourly_distance_km = NA_real_,
+    sd_hourly_distance_km = NA_real_,
+    median_hourly_distance_km = NA_real_,
+    q25_hourly_distance_km = NA_real_,
+    q75_hourly_distance_km = NA_real_,
+    duration_hours = 24,
+    mean_daily_distance_km = sum(mean_daily_distance_km, na.rm = TRUE),
+    sd_daily_distance_km = sqrt(sum(sd_daily_distance_km^2, na.rm = TRUE)),
+    median_daily_distance_km = sum(median_daily_distance_km, na.rm = TRUE),
+    q25_daily_distance_km = sum(q25_daily_distance_km, na.rm = TRUE),
+    q75_daily_distance_km = sum(q75_daily_distance_km, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Combine TOD-specific contributions with the phase-level total
+flight_distance_daily_summary <- bind_rows(
+  flight_distance_daily_tod_summary,
+  flight_distance_daily_total
+) %>%
+  mutate(
+    phen_phase = factor(phen_phase, levels = c("breeding", "winter")),
+    tod = factor(tod, levels = c("dawn", "day", "dusk", "night", "total_24h"))
+  ) %>%
+  arrange(phen_phase, tod)
+
+tagList(
+  h3("Descriptive daily flight distance by phenological phase and daytime period"),
+  datatable(
+    flight_distance_daily_summary,
+    options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 10)
+  )
+)
+
+write.csv(
+  flight_distance_daily_summary,
+  file.path(results_dir, "Flight_distance_summary.csv"),
+  row.names = FALSE
+)
+
+
+
+plot_flight_distance_descriptive_hourly <- flight_distance_hourly_summary %>%
+  ggplot(aes(x = tod, y = mean_hourly_distance_km, fill = phen_phase)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ phen_phase) +
+  labs(
+    x = "Daytime period",
+    y = "Mean hourly flight distance (km)"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_fill_manual(
+    values = c(
+      "breeding" = "#F8766D",
+      "winter" = "#619CFF"
+    )
+  )
+
+plot_flight_distance_descriptive_hourly
+
+ggsave(
+  file.path(results_dir, "plot_flight_distance_descriptive_hourly.png"),
+  plot_flight_distance_descriptive_hourly,
+  width = 15,
+  height = 10,
+  units = "cm",
+  dpi = 600
+)
+
+
+plot_flight_distance_descriptive_daily <- flight_distance_daily_summary %>%
+  ggplot(aes(x = tod, y = mean_daily_distance_km, fill = phen_phase)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ phen_phase) +
+  labs(
+    x = "Daytime period",
+    y = "Mean daily flight distance (km)"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_x_discrete(
+    labels = c(
+      dawn = "Dawn",
+      day = "Day",
+      dusk = "Dusk",
+      night = "Night",
+      total_24h = "24 h total"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "breeding" = "#F8766D",
+      "winter" = "#619CFF"
+    )
+  )
+
+plot_flight_distance_descriptive_daily
+
+ggsave(
+  file.path(results_dir, "plot_flight_distance_descriptive_daily.png"),
+  plot_flight_distance_descriptive_daily,
+  width = 15,
+  height = 10,
+  units = "cm",
+  dpi = 600
+)
+
+```
+
+# Flight height
+
+### Data preparation and error calculation
+
+Prepare the altitude dataset, identify phase-specific outliers, and estimate device- and acquisition-specific altitude error
+
+```{r message=FALSE, warning=FALSE}
+
+# List prepared per-individual datasets
+files <- list.files(path = derived_data_dir, pattern = "Data_Prep\\.csv$")
+
+# Store all valid altitude records across individuals
+data_list <- list()
+
+for (i in files) {
+  
+  x <- read.csv(file.path(derived_data_dir, i), sep = ",")
+  
+  x$UTC_datetime <- as.POSIXct(x$UTC_datetime, format = "%Y-%m-%d %H:%M:%OS", tz = "GMT")
+  x <- x[order(x$UTC_datetime),]
+  
+  # Retain points previously classified as valid during the preparation workflow
+  x <- x[is.na(x$filter) | x$filter == "OK", ]
+  
+  # Harmonise identifier types before binding all individuals
+  x <- x %>%
+    mutate(
+      device_id = as.character(device_id),
+      Individual_ID = as.character(Individual_ID)
+    )
+  
+  # Remove records without behavioural classification
+  x <- x[!is.na(x$behavior), ]
+  
+  data_list[[length(data_list) + 1]] <- x
+}
+
+# Merge all individuals and harmonise acquisition-mode labels
+data_height_complete <- bind_rows(data_list) %>%
+  mutate(
+    acquisition_mode = dplyr::recode(
+      acquisition_mode,
+      "boost_start" = "boost",
+      "boost_end"   = "boost",
+      "burst_end"   = "burst"
+    )
+  ) %>%
+  filter(!is.na(altitude_above_ground), !is.na(acquisition_mode))
+
+# Inspect the stationary altitude distribution by device and acquisition mode
+ggplot(
+  data_height_complete[data_height_complete$behavior == "stationary" & !is.na(data_height_complete$altitude_above_ground), ],
+  aes(x = altitude_above_ground, color = acquisition_mode)
+) +
+  geom_density(linewidth = 1) +
+  scale_x_continuous(
+    limits = c(-40, 40),
+    breaks = seq(-40, 40, by = 5)
+  ) +
+  facet_wrap(~ gps_model) +
+  labs(
+    title = "Altitude Distribution by GPS Model (stationary)",
+    x = "GPS Altitude (m)",
+    y = "Density",
+    color = "Acquisition mode"
+  ) +
+  theme_classic()
+
+# Define empirical outlier limits separately for stationary and flight records
+stationary_altitude_limits <- data_height_complete %>%
+  filter(behavior == "stationary") %>%
+  group_by(gps_brand, gps_model) %>%
+  summarise(
+    P2.5  = quantile(altitude_above_ground, 0.025, na.rm = TRUE),
+    P97.5 = quantile(altitude_above_ground, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+flight_altitude_limits <- data_height_complete %>%
+  filter(behavior == "flight") %>%
+  group_by(gps_brand, gps_model, phen_phase) %>%
+  summarise(
+    P2.5  = quantile(altitude_above_ground, 0.025, na.rm = TRUE),
+    P97.5 = quantile(altitude_above_ground, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Flag stationary outliers using device-specific empirical limits
+data_height <- data_height_complete %>%
+  left_join(stationary_altitude_limits, by = c("gps_brand", "gps_model")) %>%
+  mutate(
+    outlier_height = case_when(
+      behavior == "stationary" &
+        (altitude_above_ground < P2.5 | altitude_above_ground > P97.5) ~ "yes",
+      TRUE ~ "no"
+    )
+  ) %>%
+  dplyr::select(-P2.5, -P97.5)
+
+# Flag flight outliers using phase-specific empirical limits
+data_height <- data_height %>%
+  left_join(flight_altitude_limits, by = c("gps_brand", "gps_model", "phen_phase")) %>%
+  mutate(
+    outlier_height = case_when(
+      behavior == "flight" &
+        (altitude_above_ground < P2.5 | altitude_above_ground > P97.5) ~ "yes",
+      TRUE ~ outlier_height
+    )
+  ) %>%
+  dplyr::select(-P2.5, -P97.5)
+
+# Prepare stationary data used to quantify GPS vertical error
+stationary_height_data <- data_height %>%
+  filter(behavior == "stationary", outlier_height == "no") %>%
+  group_by(gps_brand, gps_model, acquisition_mode) %>%
+  mutate(
+    residual_to_median = altitude_above_ground - median(altitude_above_ground, na.rm = TRUE),
+    abs_dev_from_median = abs(residual_to_median),
+    abs_error = abs(altitude_above_ground)
+  ) %>%
+  ungroup()
+
+# Summarise trueness, precision, and accuracy metrics for stationary fixes
+device_error <- stationary_height_data %>%
+  group_by(gps_brand, gps_model, acquisition_mode) %>%
+  summarise(
+    n_stationary_fixes = dplyr::n(),
+    n_individuals = n_distinct(Individual_ID),
+    trueness_mean_signed_error_m = mean(altitude_above_ground, na.rm = TRUE),
+    trueness_median_signed_error_m = median(altitude_above_ground, na.rm = TRUE),
+    precision_sd_m = sd(residual_to_median, na.rm = TRUE),
+    precision_mean_abs_dev_m = mean(abs_dev_from_median, na.rm = TRUE),
+    precision_median_abs_dev_m = median(abs_dev_from_median, na.rm = TRUE),
+    precision_q95_abs_dev_m = quantile(abs_dev_from_median, 0.95, na.rm = TRUE),
+    precision_rmse_m = sqrt(mean(residual_to_median^2, na.rm = TRUE)),
+    accuracy_mean_abs_error_m = mean(abs_error, na.rm = TRUE),
+    accuracy_median_abs_error_m = median(abs_error, na.rm = TRUE),
+    accuracy_q95_abs_error_m = quantile(abs_error, 0.95, na.rm = TRUE),
+    accuracy_rmse_m = sqrt(mean(altitude_above_ground^2, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(species = "Burhinus oedicnemus") %>%
+  relocate(species, .before = 1)
+
+tagList(
+  h3("GPS vertical error metrics"),
+  datatable(device_error, options = list(scrollX = TRUE, pageLength = 10))
+)
+
+write.csv(device_error, file.path(results_dir, "GPS_error_metrics.csv"), row.names = FALSE)
+
+# Append device-specific error terms to each record
+data_height <- data_height %>%
+  left_join(device_error, by = c("gps_brand", "gps_model", "acquisition_mode"))
+
+# Export the height dataset used in the altitude analyses
+data_height <- data_height %>%
+  dplyr::select(
+    Individual_ID,
+    UTC_datetime,
+    phen_phase,
+    tod,
+    acquisition_mode,
+    
+    behavior,
+    ground_elevation,
+    altitude_above_ground,
+    gps_model,
+    gps_model_full,
+    outlier_height,
+    n_stationary_fixes,
+    n_individuals,
+    trueness_median_signed_error_m,
+    precision_sd_m,
+    
+    satcount,
+    U_bat_mV,
+    bat_soc_pct,
+    solar_I_mA,
+    hdop,
+    Altitude_m,
+    speed_km_h,
+    direction_deg,
+    temperature_C,
+    int_temperature_C,
+    mag_x, mag_y, mag_z,
+    acc_x, acc_y, acc_z
+  )
+
+write.csv(data_height, file.path(results_dir, "Flight_height_data.csv"), row.names = FALSE)
+
+```
+
+### Bootstrap
+
+Propagate vertical GPS error by repeatedly correcting altitude above ground using device-specific bias and residual error estimates
+
+```{r message=FALSE, warning=FALSE}
+
+plan(multisession)
+
+# Remove systematic bias and add one random draw from the residual error distribution
+correct_altitude <- function(altitude, bias_m, precision_sd_m) {
+  mapply(function(alt, bias, sd_val) {
+    alt_corr <- alt - bias
+    alt_corr + rnorm(1, mean = 0, sd = sd_val)
+  }, altitude, bias_m, precision_sd_m)
+}
+
+# Generate bootstrap-corrected altitudes within each individual × phase × tod group
+bootstrap_corrected_altitudes <- function(df, n_boot = 100) {
+  purrr::map(1:n_boot, function(i) {
+    correct_altitude(
+      altitude = df$altitude_above_ground,
+      bias_m = df$trueness_median_signed_error_m,
+      precision_sd_m = df$precision_sd_m
+    )
+  }) %>%
+    dplyr::bind_cols()
+}
+
+# Retain only flight records used in the height analysis
+flight_data <- data_height %>%
+  filter(behavior == "flight", outlier_height == "no") %>%
+  filter(!is.na(Individual_ID))
+
+# Apply bootstrap correction separately within each phase × tod × individual group
+flight_groups_by_phase_tod_id <- flight_data %>%
+  group_by(phen_phase, tod, Individual_ID) %>%
+  group_split()
+
+bootstrap_altitudes_list <- future_map(
+  flight_groups_by_phase_tod_id,
+  bootstrap_corrected_altitudes,
+  n_boot = 100,
+  .options = furrr_options(seed = 1234)
+)
+
+# Reshape the bootstrap output for downstream summaries
+bootstrap_altitudes_long <- map2_dfr(
+  bootstrap_altitudes_list,
+  flight_groups_by_phase_tod_id,
+  function(altitudes_df, original_df) {
+    altitudes_df %>%
+      mutate(row_id = 1:n()) %>%
+      pivot_longer(
+        cols = -row_id,
+        names_to = "bootstrap",
+        values_to = "corrected_altitude"
+      ) %>%
+      mutate(
+        phen_phase = original_df$phen_phase[1],
+        tod = original_df$tod[1],
+        Individual_ID = original_df$Individual_ID[1]
+      )
+  }
+)
+
+plan(sequential)
+
+```
+
+### Descriptive summaries of corrected flight height by phenological phase and daytime period
+
+```{r}
+
+# Count data support directly from the non-bootstrapped flight dataset
+phase_levels <- c("breeding", "post_breeding", "winter")
+phase_levels <- phase_levels[phase_levels %in% unique(flight_data$phen_phase)]
+
+flight_height_support_tod <- flight_data %>%
+  filter(phen_phase != "other") %>%
+  group_by(phen_phase, tod) %>%
+  summarise(
+    n_individuals = n_distinct(Individual_ID),
+    n_fixes = dplyr::n(),
+    .groups = "drop"
+  )
+
+flight_height_support_phase <- flight_data %>%
+  filter(phen_phase != "other") %>%
+  group_by(phen_phase) %>%
+  summarise(
+    n_individuals = n_distinct(Individual_ID),
+    n_fixes = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  mutate(tod = "all") %>%
+  relocate(tod, .after = phen_phase)
+
+# Summarise the bootstrap distribution of corrected flight height by phenological phase and daytime period
+flight_height_summary_tod <- bootstrap_altitudes_long %>%
+  filter(phen_phase != "other") %>%
+  group_by(bootstrap, phen_phase, tod) %>%
+  summarise(
+    mean_height_boot_m = mean(corrected_altitude, na.rm = TRUE),
+    median_height_boot_m = median(corrected_altitude, na.rm = TRUE),
+    q25_height_boot_m = quantile(corrected_altitude, 0.25, na.rm = TRUE),
+    q75_height_boot_m = quantile(corrected_altitude, 0.75, na.rm = TRUE),
+    sd_height_boot_m = sd(corrected_altitude, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(phen_phase, tod) %>%
+  summarise(
+    mean_height_m = median(mean_height_boot_m, na.rm = TRUE),
+    mean_height_lcl_m = quantile(mean_height_boot_m, 0.025, na.rm = TRUE),
+    mean_height_ucl_m = quantile(mean_height_boot_m, 0.975, na.rm = TRUE),
+    median_height_m = median(median_height_boot_m, na.rm = TRUE),
+    median_height_lcl_m = quantile(median_height_boot_m, 0.025, na.rm = TRUE),
+    median_height_ucl_m = quantile(median_height_boot_m, 0.975, na.rm = TRUE),
+    q25_height_m = median(q25_height_boot_m, na.rm = TRUE),
+    q75_height_m = median(q75_height_boot_m, na.rm = TRUE),
+    sd_height_m = median(sd_height_boot_m, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(flight_height_support_tod, by = c("phen_phase", "tod"))
+
+# Summarise the bootstrap distribution of corrected flight height by phenological phase only
+flight_height_summary_phase <- bootstrap_altitudes_long %>%
+  filter(phen_phase != "other") %>%
+  group_by(bootstrap, phen_phase) %>%
+  summarise(
+    mean_height_boot_m = mean(corrected_altitude, na.rm = TRUE),
+    median_height_boot_m = median(corrected_altitude, na.rm = TRUE),
+    q25_height_boot_m = quantile(corrected_altitude, 0.25, na.rm = TRUE),
+    q75_height_boot_m = quantile(corrected_altitude, 0.75, na.rm = TRUE),
+    sd_height_boot_m = sd(corrected_altitude, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(phen_phase) %>%
+  summarise(
+    mean_height_m = median(mean_height_boot_m, na.rm = TRUE),
+    mean_height_lcl_m = quantile(mean_height_boot_m, 0.025, na.rm = TRUE),
+    mean_height_ucl_m = quantile(mean_height_boot_m, 0.975, na.rm = TRUE),
+    median_height_m = median(median_height_boot_m, na.rm = TRUE),
+    median_height_lcl_m = quantile(median_height_boot_m, 0.025, na.rm = TRUE),
+    median_height_ucl_m = quantile(median_height_boot_m, 0.975, na.rm = TRUE),
+    q25_height_m = median(q25_height_boot_m, na.rm = TRUE),
+    q75_height_m = median(q75_height_boot_m, na.rm = TRUE),
+    sd_height_m = median(sd_height_boot_m, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(tod = "all") %>%
+  relocate(tod, .after = phen_phase) %>%
+  left_join(flight_height_support_phase, by = c("phen_phase", "tod"))
+
+# Combine TOD-specific and phase-level summaries
+flight_height_summary <- bind_rows(
+  flight_height_summary_tod,
+  flight_height_summary_phase
+) %>%
+  mutate(
+    species = "Burhinus oedicnemus",
+    phen_phase = factor(phen_phase, levels = phase_levels),
+    tod = factor(tod, levels = c("dawn", "day", "dusk", "night", "all"))
+  ) %>%
+  arrange(phen_phase, tod) %>%
+  relocate(species, .before = 1)
+
+tagList(
+  h3("Descriptive corrected flight height by phenological phase and daytime period"),
+  datatable(
+    flight_height_summary,
+    options = list(scrollX = TRUE, scrollY = TRUE, pageLength = 12)
+  )
+)
+
+write.csv(
+  flight_height_summary,
+  file.path(results_dir, "Flight_height_summary.csv"),
+  row.names = FALSE
+)
+
+
+# Plot descriptive median flight height with bootstrap percentile intervals
+plot_flight_height_descriptive <- flight_height_summary %>%
+  ggplot(aes(x = tod, y = median_height_m, color = phen_phase)) +
+  geom_errorbar(
+    aes(ymin = median_height_lcl_m, ymax = median_height_ucl_m),
+    position = position_dodge(width = 0.8),
+    width = 0.2,
+    colour = "black"
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.8),
+    size = 2.5
+  ) +
+  facet_wrap(~ phen_phase) +
+  labs(
+    x = "Daytime period",
+    y = "Corrected median flight height (m)"
+  ) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+plot_flight_height_descriptive
+
+ggsave(
+  file.path(results_dir, "plot_flight_height_descriptive.png"),
+  plot_flight_height_descriptive,
+  width = 15,
+  height = 10,
+  units = "cm",
+  dpi = 600
+)
+
+```
+
+# Session information
+
+R and package versions used to render this analytical workflow.
+
+```{r session-information}
+sessionInfo()
+```
