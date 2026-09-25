@@ -2,7 +2,7 @@
 
 This repository contains the R code used to process GPS tracking data and derive the flight-metric products described in the Data Descriptor:
 
-**A curated and standardised dataset of flight metrics for Iberian steppe birds**
+**A standardised flight-metrics dataset for threatened Iberian steppe birds**
 
 The workflow was developed for five Iberian steppe bird species:
 
@@ -85,7 +85,7 @@ Flight-height calculations additionally require the Spanish **MDT02-cob2 2 m dig
 
 The processed data products associated with this repository are archived in Zenodo:
 
-**Crispim-Mendes, T. et al. (2026). A curated and standardised dataset of flight metrics for Iberian steppe birds. Zenodo.**  
+**Crispim-Mendes, T. et al. (2026). A standardised flight-metrics dataset for threatened Iberian steppe birds. Zenodo.**  
 https://doi.org/10.5281/zenodo.22767894
 
 The Zenodo archive contains harmonised multi-species summary tables and species-level movement, boost-flight and flight-height products. Geographic coordinates are not included in the public archive.
@@ -94,7 +94,7 @@ The Zenodo archive contains harmonised multi-species summary tables and species-
 
 This repository accompanies the manuscript:
 
-**Crispim-Mendes, T. et al. A curated and standardised dataset of flight metrics for Iberian steppe birds.**  
+**Crispim-Mendes, T. et al. A standardised flight-metrics dataset for threatened Iberian steppe birds.**  
 *Scientific Data* (manuscript in preparation/submission).
 
 The final article citation and DOI will be added here after publication.
